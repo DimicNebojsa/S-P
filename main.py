@@ -1,47 +1,59 @@
+# === Imports ===
 
-
-import pandas as pd
 import os
+import pandas as pd
 import snowflake.connector
-#from config import SNOWFLAKEUSER,SNOWFLAKEPASS
+from dotenv import load_dotenv
+from getpass import getpass
+
 from pymilvus import connections
 from pymilvus import Collection, CollectionSchema, FieldSchema, DataType, utility
 
-from dotenv import load_dotenv
-from getpass import getpass
-import os
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# === Load environment variables ===
 
 load_dotenv()
 
 SNOWFLAKEUSER = os.getenv("SNOWFLAKEUSER")
 SNOWFLAKEPASS = os.getenv("SNOWFLAKEPASS")
 
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or getpass(
-      "Enter OpenAI API Key: "
-)
+# Set OpenAI API key from environment or prompt interactively
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or getpass("Enter OpenAI API Key: ")
 
+# === Snowflake Connection ===
 
 def get_snowflake_connection():
+    """
+    Establishes and returns a Snowflake cursor connection.
+    """
     ctx = snowflake.connector.connect(
         user=SNOWFLAKEUSER,
         password=SNOWFLAKEPASS,
         account='cbc51873.us-east-1',
         warehouse='CUSTOMER_WH',
-        role='PUBLIC',  # As per screenshot, current role shown is PUBLIC
+        role='PUBLIC',
         database='AI_READY_DATA_TRIAL_CONSUMER',
         schema='AI_READY_DATA_TRIAL'
     )
     cs = ctx.cursor()
     return cs
 
-
 def read_data_from_snowflake(cs, sql_query):
+    """
+    Executes a query and returns the result as a Pandas DataFrame.
+    """
     cs.execute(sql_query)
     df = cs.fetch_pandas_all()
     return df
 
+# === Milvus Connection ===
 
 def get_milvus_connection(alias, MILVUS_PORT, MILVUS_HOST):
+    """
+    Connects to Milvus server with provided host and port.
+    """
     try:
         connections.connect(
             alias=alias,
@@ -55,71 +67,50 @@ def get_milvus_connection(alias, MILVUS_PORT, MILVUS_HOST):
         print(f"Failed to connect to Milvus ({alias}): {e}")
         return False
 
+# === DataFrame Transformation ===
 
 def prepare_final_df(df):
-    # Create metadata column excluding SOURCEURI
-    metadata_columns = df.columns.difference(['SOURCEURI'])  # all except SOURCEURI
-    # Apply row-wise to_dict and assign to 'metadata' column
+    """
+    Prepares a final DataFrame by isolating metadata and initializing `raw_content`.
+    """
+    metadata_columns = df.columns.difference(['SOURCEURI'])
     df['metadata'] = df[metadata_columns].to_dict(orient='records')
     df['raw_content'] = None
-    # Create final DataFrame with just 'metadata' and 'SOURCEURI'
     final_df = df[['metadata', 'SOURCEURI', 'raw_content']]
-    # Preview result
-    final_df
     return final_df
 
+# === Load data from Snowflake ===
 
 cs = get_snowflake_connection()
+
+# Load DOCUMENT_METADATA
 sql_query = 'SELECT * FROM "DOCUMENT_METADATA"'
-df = read_data_from_snowflake(cs,sql_query)
+df = read_data_from_snowflake(cs, sql_query)
 
-#print(df.head())
-
+# Load SEGMENT_METADATA (limit for testing)
 sql_query = 'SELECT * FROM "SEGMENT_METADATA" LIMIT 100'
-df = read_data_from_snowflake(cs,sql_query)
+df = read_data_from_snowflake(cs, sql_query)
 
-#print(df.head())
-
-
-### Helper function
+# === Helper to extract chunks per document ===
 
 def get_chunks_by_documentid(df: pd.DataFrame, documentid: str) -> list:
     """
-    Filters the DataFrame for rows with the given documentid,
-    and returns a list of values from the 'PROCESSEDSEGMENTCONTENT' column.
-
-    Args:
-        df (pd.DataFrame): The DataFrame containing your data.
-        documentid (str): The document ID to filter by.
-
-    Returns:
-        List[str]: A list of chunk values from PROCESSEDSEGMENTCONTENT.
+    Filters rows by DOCUMENTID and returns their PROCESSEDSEGMENTCONTENT values as a list.
     """
     filtered_df = df[df["DOCUMENTID"] == documentid]
     chunks = filtered_df["PROCESSEDSEGMENTCONTENT"].tolist()
     return chunks
 
+# Show row count per document (optional)
 row_counts = df.groupby("DOCUMENTID").size().reset_index(name='row_count')
 
-#row_counts
+# === OpenAI model setup ===
 
 openai_model = "gpt-4o-mini"
-
-from langchain_openai import ChatOpenAI
-
-# For normal accurate responses
 llm = ChatOpenAI(temperature=0.0, model=openai_model)
 
+# === Prompt template for reconstruction ===
 
-list_of_docs = df['DOCUMENTID'].unique().tolist()
-
-### dictionary with key which is document id and value that is original document
-
-result_dict = {}
-
-from langchain_core.prompts import ChatPromptTemplate
-
-# Updated system prompt
 reconstruct_system_prompt = """
 You are an AI assistant helping reconstruct the original document from a list of unordered chunks.
 
@@ -128,46 +119,44 @@ Your task is to organize the chunks in a logical order and rewrite them as a coh
 Do NOT add any explanations or commentary — only return the final reconstructed document as clean text.
 """
 
-# Prompt template with the new instruction
 reconstruct_prompt_template = ChatPromptTemplate.from_messages([
     ("system", reconstruct_system_prompt),
     ("user", "{chunks}"),
 ])
 
+# === Reconstruct documents using LLM ===
+
+list_of_docs = df['DOCUMENTID'].unique().tolist()
+result_dict = {}
+
 index = 1
 for doc in list_of_docs:
-    # Example input chunks (replace this with your actual list)
     chunks = get_chunks_by_documentid(df, doc)
-
-    # Convert to single string input
     chunks_input = "\n".join(chunks)
-
-    # Create pipeline
     reconstruct_pipeline = reconstruct_prompt_template | llm
-
-    # Run the chain
     reconstructed_document = reconstruct_pipeline.invoke({"chunks": chunks_input}).content
-
-    # print(reconstructed_document)
-
     result_dict[doc] = reconstructed_document
-
     print(index, doc)
     index += 1
 
 print(result_dict)
 
-## Semantic similarity approach (much faster then OpenAI, but now as acurate)
+# === Alternative: Fast Semantic Similarity-Based Reconstruction ===
 
 def compute_overlap(a, b, min_len=0):
+    """
+    Computes character overlap length between end of `a` and start of `b`.
+    """
     max_len = min(len(a), len(b))
     for i in range(max_len, min_len - 1, -1):
         if a[-i:] == b[:i]:
             return i
     return 0
 
-
 def build_overlap_chain(chunks, start_idx):
+    """
+    Constructs document by chaining chunks based on maximum overlap.
+    """
     used = set()
     used.add(start_idx)
     sequence = [chunks[start_idx]]
@@ -196,21 +185,22 @@ def build_overlap_chain(chunks, start_idx):
 
     return "".join(sequence)
 
-
 def reconstruct_best_order(chunks):
+    """
+    Tries all starting positions to find the best reconstruction by overlap score.
+    """
     best_result = None
     best_score = float('inf')
     for i in range(len(chunks)):
         result = build_overlap_chain(chunks, start_idx=i)
-        score = len(result)  # shorter result means better merging
+        score = len(result)  # smaller = better merging
         if score < best_score:
             best_score = score
             best_result = result
     return best_result
 
-
+# Reconstruct documents using overlap-based heuristic
 result_dict_second = {}
-
 
 for doc in list_of_docs:
     chunks = get_chunks_by_documentid(df, doc)
@@ -220,4 +210,3 @@ for doc in list_of_docs:
 print(result_dict_second)
 
 print("Done....")
-
