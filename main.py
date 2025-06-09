@@ -11,7 +11,11 @@ from pymilvus import Collection, CollectionSchema, FieldSchema, DataType, utilit
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
-from database import insert_document, drop_table, test_connection, create_table, fetch_documents
+from database import insert_document, drop_table, test_connection, create_table, fetch_documents, conn_params
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from datetime import datetime
 
 # === Load environment variables ===
 load_dotenv()
@@ -119,7 +123,6 @@ for doc in list_of_docs:
     reconstructed_document = reconstruct_pipeline.invoke({"chunks": chunks_input}).content
 
     result_dict[doc] = reconstructed_document
-
     print(index, doc)
     index += 1
 
@@ -127,26 +130,135 @@ for doc in list_of_docs:
 result_dict_df = pd.DataFrame(result_dict.items(), columns=['DOCUMENTID', 'ORIGINAL DOCUMENT'])
 joined_df = pd.merge(df_document, result_dict_df, on='DOCUMENTID', how='inner')
 
-print(joined_df)
+# === TXT writer ===
+def write_documents_to_txt(documents, output_folder):
+    # Ensure the output folder exists
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"📁 Created output folder: {output_folder}")
 
-# === Insert into database ===
-def insert_df_into_db(joined_df):
-    for idx in range(len(joined_df)):
-        row = joined_df.iloc[idx]
-        document_id = str(row["DOCUMENTID"])
-        original_document = row["ORIGINAL DOCUMENT"]
+    for _, row in documents.iterrows():  # Correctly iterate DataFrame rows
+        row = row.to_dict()  # Convert Series to dict
+        doc_id = row.get("documentid") or row.get("DOCUMENTID")
+        if not doc_id:
+            print("⚠️ Skipping document without DOCUMENTID.")
+            continue
 
-        try:
-            insert_document(document_id, original_document)
-        except Exception as e:
-            print(f"❌ Failed to insert {document_id}: {e}")
+        filename = f"{doc_id}.txt"
+        filepath = os.path.join(output_folder, filename)
+
+        if os.path.exists(filepath):
+            print("File exists, skipping:", filename)
+            continue
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            for key, value in row.items():
+                f.write(f"{key}: {value}\n")
+
+# === Insert logic with conditional overwrite ===
+def insert_df_into_db(joined_df, output_folder):
+    # Ensure output folder exists
+    os.makedirs(output_folder, exist_ok=True)
+
+    try:
+        conn = psycopg2.connect(**conn_params)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        for idx in range(len(joined_df)):
+            row = joined_df.iloc[idx]
+            doc_id = str(row["DOCUMENTID"])
+
+            # Check if DOCUMENTID already exists
+            cursor.execute("SELECT UPDATED FROM documents WHERE DOCUMENTID = %s;", (doc_id,))
+            result = cursor.fetchone()
+
+            new_updated = pd.to_datetime(row["UPDATED"]).to_pydatetime() if pd.notna(row["UPDATED"]) else None
+            should_write = False
+
+            if result is None:
+                should_write = True
+                action = "inserted"
+            else:
+                existing_updated = result["updated"]
+                if new_updated and existing_updated and new_updated > existing_updated:
+                    should_write = True
+                    action = "updated"
+
+            if should_write:
+                cursor.execute("""
+                    INSERT INTO documents (
+                        DOCUMENTID, NAME, DOCUMENTTITLE, PUBLISHED, UPDATED, FILETYPE,
+                        FILESIZE, SOURCEURI, REPORTINGFREQUENCY, PRIMARYENTITYTYPE,
+                        PRIMARYENTITYNAME, DOCUMENT_PRIMARY_ENTITY_ID, OTHERDOCUMENTMETADATA,
+                        DOCUMENTTYPE, VERSION, ORIGINAL_DOCUMENT
+                    ) VALUES (
+                        %(DOCUMENTID)s, %(NAME)s, %(DOCUMENTTITLE)s, %(PUBLISHED)s, %(UPDATED)s,
+                        %(FILETYPE)s, %(FILESIZE)s, %(SOURCEURI)s, %(REPORTINGFREQUENCY)s,
+                        %(PRIMARYENTITYTYPE)s, %(PRIMARYENTITYNAME)s, %(DOCUMENT_PRIMARY_ENTITY_ID)s,
+                        %(OTHERDOCUMENTMETADATA)s, %(DOCUMENTTYPE)s, %(VERSION)s, %(ORIGINAL_DOCUMENT)s
+                    )
+                    ON CONFLICT (DOCUMENTID) DO UPDATE SET
+                        NAME = EXCLUDED.NAME,
+                        DOCUMENTTITLE = EXCLUDED.DOCUMENTTITLE,
+                        PUBLISHED = EXCLUDED.PUBLISHED,
+                        UPDATED = EXCLUDED.UPDATED,
+                        FILETYPE = EXCLUDED.FILETYPE,
+                        FILESIZE = EXCLUDED.FILESIZE,
+                        SOURCEURI = EXCLUDED.SOURCEURI,
+                        REPORTINGFREQUENCY = EXCLUDED.REPORTINGFREQUENCY,
+                        PRIMARYENTITYTYPE = EXCLUDED.PRIMARYENTITYTYPE,
+                        PRIMARYENTITYNAME = EXCLUDED.PRIMARYENTITYNAME,
+                        DOCUMENT_PRIMARY_ENTITY_ID = EXCLUDED.DOCUMENT_PRIMARY_ENTITY_ID,
+                        OTHERDOCUMENTMETADATA = EXCLUDED.OTHERDOCUMENTMETADATA,
+                        DOCUMENTTYPE = EXCLUDED.DOCUMENTTYPE,
+                        VERSION = EXCLUDED.VERSION,
+                        ORIGINAL_DOCUMENT = EXCLUDED.ORIGINAL_DOCUMENT;
+                """, {
+                    "DOCUMENTID": doc_id,
+                    "NAME": str(row["NAME"]) if pd.notna(row["NAME"]) else None,
+                    "DOCUMENTTITLE": str(row["DOCUMENTTITLE"]) if pd.notna(row["DOCUMENTTITLE"]) else None,
+                    "PUBLISHED": pd.to_datetime(row["PUBLISHED"]).to_pydatetime() if pd.notna(row["PUBLISHED"]) else None,
+                    "UPDATED": new_updated,
+                    "FILETYPE": str(row["FILETYPE"]) if pd.notna(row["FILETYPE"]) else None,
+                    "FILESIZE": float(row["FILESIZE"]) if pd.notna(row["FILESIZE"]) else None,
+                    "SOURCEURI": str(row["SOURCEURI"]) if pd.notna(row["SOURCEURI"]) else None,
+                    "REPORTINGFREQUENCY": str(row["REPORTINGFREQUENCY"]) if pd.notna(row["REPORTINGFREQUENCY"]) else None,
+                    "PRIMARYENTITYTYPE": str(row["PRIMARYENTITYTYPE"]) if pd.notna(row["PRIMARYENTITYTYPE"]) else None,
+                    "PRIMARYENTITYNAME": str(row["PRIMARYENTITYNAME"]) if pd.notna(row["PRIMARYENTITYNAME"]) else None,
+                    "DOCUMENT_PRIMARY_ENTITY_ID": str(row["DOCUMENT_PRIMARY_ENTITY_ID"]) if pd.notna(row["DOCUMENT_PRIMARY_ENTITY_ID"]) else None,
+                    "OTHERDOCUMENTMETADATA": row["OTHERDOCUMENTMETADATA"] if isinstance(row["OTHERDOCUMENTMETADATA"], dict) else None,
+                    "DOCUMENTTYPE": str(row["DOCUMENTTYPE"]) if pd.notna(row["DOCUMENTTYPE"]) else None,
+                    "VERSION": str(row["VERSION"]) if pd.notna(row["VERSION"]) else None,
+                    "ORIGINAL_DOCUMENT": str(row["ORIGINAL DOCUMENT"]) if pd.notna(row["ORIGINAL DOCUMENT"]) else None,
+                })
+                print(f"✅ Document {action}: {doc_id}")
+
+                # Write to TXT file
+                filename = f"{doc_id}.txt"
+                filepath = os.path.join(output_folder, filename)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    for col in row.index:
+                        f.write(f"{col}: {row[col]}\n")
+            else:
+                print(f"⏭️  Skipped (not newer): {doc_id}")
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"❌ Insert or update failed: {e}")
+
+# === Optional: Force-update first two rows for testing ===
+#joined_df.at[0, "UPDATED"] = datetime.now()
+#joined_df.at[1, "UPDATED"] = datetime.now()
 
 # === Run full pipeline ===
 if __name__ == "__main__":
-    drop_table()
+    #drop_table()
     test_connection()
     create_table()
-    insert_df_into_db(joined_df)
-    print("-------------------------------------------------------")
-    fetch_documents()
+    insert_df_into_db(joined_df, os.getenv("OUTPUT_FOLDER"))
+    documents = fetch_documents()
     print("Done.")
+
