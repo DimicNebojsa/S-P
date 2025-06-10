@@ -69,7 +69,7 @@ sql_query = 'SELECT * FROM "DOCUMENT_METADATA"'
 df_document = read_data_from_snowflake(cs, sql_query)
 
 # Load SEGMENT_METADATA (limit 20 for testing)
-sql_query = 'SELECT * FROM "SEGMENT_METADATA" LIMIT 20'
+sql_query = 'SELECT * FROM "SEGMENT_METADATA" LIMIT 1000'
 df = read_data_from_snowflake(cs, sql_query)
 
 # === Helper to extract chunks per DOCUMENTID ===
@@ -349,7 +349,7 @@ if __name__ == "__main__":
     #drop_table()
     test_connection()
     create_table()
-    insert_df_into_db_bulk(joined_df, os.getenv("OUTPUT_FOLDER"), chunk_size=2)
+    insert_df_into_db_bulk(joined_df, os.getenv("OUTPUT_FOLDER"), chunk_size=50)
     documents = fetch_documents()
     print("Done.")
 
