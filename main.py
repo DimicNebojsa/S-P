@@ -99,7 +99,41 @@ llm = ChatOpenAI(
     model="gpt-4o-mini"
 )
 
-# === Reconstruct documents using LLM ===
+# # === Reconstruct documents using LLM ===
+# reconstruct_system_prompt = """
+# You are an AI assistant helping reconstruct the original document from a list of unordered chunks.
+#
+# Your task is to organize the chunks in a logical order and rewrite them as a coherent, well-structured document.
+#
+# Do NOT add any explanations or commentary — only return the final reconstructed document as clean text.
+# """
+#
+# reconstruct_prompt_template = ChatPromptTemplate.from_messages([
+#     ("system", reconstruct_system_prompt),
+#     ("user", "{chunks}"),
+# ])
+#
+# list_of_docs = df['DOCUMENTID'].unique().tolist()
+# result_dict = {}
+#
+# index = 1
+# for doc in list_of_docs:
+#     chunks = get_chunks_by_documentid(df, doc)
+#     chunks_input = "\n".join(chunks)
+#
+#     reconstruct_pipeline = reconstruct_prompt_template | llm
+#     reconstructed_document = reconstruct_pipeline.invoke({"chunks": chunks_input}).content
+#
+#     result_dict[doc] = reconstructed_document
+#     print(index, doc)
+#     index += 1
+
+
+
+### ***************
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- Prompt setup ---
 reconstruct_system_prompt = """
 You are an AI assistant helping reconstruct the original document from a list of unordered chunks.
 
@@ -113,20 +147,28 @@ reconstruct_prompt_template = ChatPromptTemplate.from_messages([
     ("user", "{chunks}"),
 ])
 
-list_of_docs = df['DOCUMENTID'].unique().tolist()
-result_dict = {}
+reconstruct_pipeline = reconstruct_prompt_template | llm
 
-index = 1
-for doc in list_of_docs:
-    chunks = get_chunks_by_documentid(df, doc)
+
+# --- Helper function for parallel execution ---
+def reconstruct_one(doc_id):
+    chunks = get_chunks_by_documentid(df, doc_id)
     chunks_input = "\n".join(chunks)
+    output = reconstruct_pipeline.invoke({"chunks": chunks_input}).content
+    return doc_id, output
 
-    reconstruct_pipeline = reconstruct_prompt_template | llm
-    reconstructed_document = reconstruct_pipeline.invoke({"chunks": chunks_input}).content
 
-    result_dict[doc] = reconstructed_document
-    print(index, doc)
-    index += 1
+# --- Run in parallel ---
+result_dict = {}
+max_threads = 10  # Adjust based on your LLM rate limit
+
+with ThreadPoolExecutor(max_workers=max_threads) as executor:
+    futures = {executor.submit(reconstruct_one, doc): doc for doc in df['DOCUMENTID'].unique()}
+
+    for i, future in enumerate(as_completed(futures), start=1):
+        doc_id, reconstructed = future.result()
+        result_dict[doc_id] = reconstructed
+        print(i, doc_id)
 
 # === Create DataFrame from results and join with metadata ===
 result_dict_df = pd.DataFrame(result_dict.items(), columns=['DOCUMENTID', 'ORIGINAL DOCUMENT'])
@@ -346,7 +388,7 @@ def insert_df_into_db_bulk(joined_df, output_folder, chunk_size=100):
 
 # === Run full pipeline ===
 if __name__ == "__main__":
-    #drop_table()
+    drop_table()
     test_connection()
     create_table()
     insert_df_into_db_bulk(joined_df, os.getenv("OUTPUT_FOLDER"), chunk_size=50)
